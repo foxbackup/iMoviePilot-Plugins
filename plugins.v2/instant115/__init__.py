@@ -29,7 +29,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.9"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -120,23 +120,55 @@ class Instant115(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
-                    {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}},
-                    {"component": "VSwitch", "props": {"model": "notify", "label": "上传成功后发送通知"}},
-                    {"component": "VTextField", "props": {"model": "target_path", "label": "115目标上传目录", "placeholder": "/PT"}},
-                    {"component": "VTextField", "props": {"model": "skip_tags", "label": "跳过的 qB 标签", "placeholder": "多个标签用英文逗号分隔，如：MOVIEPILOT,已上传115"}},
-                    {"component": "VTextField", "props": {"model": "uploaded_tag", "label": "上传完成后添加 qB 标签", "placeholder": "已上传115"}},
-                    {"component": "VTextField", "props": {"model": "cooldown_minutes", "label": "冷却重试时间 分钟", "type": "number", "hint": "检测到 115 进入分片上传时跳过并冷却。"}},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "scan_interval", "label": "扫描间隔 分钟", "type": "number"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_tasks_per_scan", "label": "每轮最多处理任务数", "type": "number"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_retry", "label": "最大重试次数", "type": "number", "hint": "0 表示不限次数。"}}]}
-                    ]},
-                    {"component": "VTextField", "props": {"model": "record_keep_days", "label": "记录保留天数", "type": "number"}},
-                    {"component": "VTextField", "props": {"model": "running_lock_timeout_minutes", "label": "运行锁超时 分钟", "type": "number", "hint": "插件异常中断或热重载后，超过该时间的运行锁会自动释放。"}},
-                    {"component": "VSwitch", "props": {"model": "clear_records", "label": "保存后清空历史记录"}},
-                    {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": "本插件不再按上传流量阈值判断，而是在调用 115 OpenAPI 初始化上传后，只接受 status=2 秒传；如果需要进入 OSS 分片上传，立即判定为非秒传并进入冷却，不继续占用本地上传带宽。"}}
-                ]
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件", "hint": "启用后按扫描间隔自动检查 qB 完成任务。", "persistent-hint": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次", "hint": "保存配置后触发一次后台扫描。", "persistent-hint": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知", "hint": "秒传成功后发送插件通知。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {"component": "VDivider", "props": {"class": "my-3"}},
+                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mb-3", "text": "工作方式：先全量筛选 qB 种子，再计算 SHA1/preid/size 缓存；写入最终 115 目录时只接受 status=2 秒传。若需要分片上传，则跳过并冷却。"}},
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "target_path", "label": "115 目标上传目录", "placeholder": "/PT", "hint": "会在该目录下创建与种子名相同的文件夹。", "persistent-hint": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "uploaded_tag", "label": "上传完成后添加 qB 标签", "placeholder": "已上传115", "hint": "秒传成功后给 qBittorrent 任务添加的标签。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "skip_tags", "label": "跳过的 qB 标签", "placeholder": "多个标签用英文逗号分隔，如：MOVIEPILOT,已上传115", "hint": "任务包含任意一个标签时跳过，不进入队列。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {"component": "VDivider", "props": {"class": "my-3"}},
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "scan_interval", "label": "扫描间隔（分钟）", "type": "number", "min": 1}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_tasks_per_scan", "label": "每轮最多处理任务数", "type": "number", "min": 1}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cooldown_minutes", "label": "冷却重试（分钟）", "type": "number", "min": 1, "hint": "检测到需要 115 分片上传时进入冷却。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_retry", "label": "最大重试次数", "type": "number", "min": 0, "hint": "0 表示不限次数。", "persistent-hint": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "record_keep_days", "label": "记录保留天数", "type": "number", "min": 1}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "running_lock_timeout_minutes", "label": "运行锁超时（分钟）", "type": "number", "min": 10, "hint": "异常中断或热重载后，超过该时间自动释放运行锁。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {"component": "VDivider", "props": {"class": "my-3"}},
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "clear_records", "label": "保存后清空历史记录", "color": "warning"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": "插件不会调用 U115Pan.upload()，也不会进行 OSS 分片上传。若 115 返回非秒传，会跳过任务并冷却；仅清理本轮新建且为空的目标目录。"}}]},
+                        ],
+                    },
+                ],
             }
         ], self._current_config()
 
@@ -276,7 +308,7 @@ class Instant115(_PluginBase):
         lock_timeout = self._running_lock_timeout_minutes * 60
         if isinstance(runtime, dict) and runtime.get("running") and lock_started and now - lock_started < lock_timeout:
             logger.info(f"秒传115持久化运行锁仍有效，本次扫描跳过；锁定开始：{self._format_time(lock_started)}，超时：{self._running_lock_timeout_minutes} 分钟")
-            return False
+            return None
         if isinstance(runtime, dict) and runtime.get("running") and lock_started and now - lock_started >= lock_timeout:
             logger.warning(f"秒传115检测到运行锁超时，自动释放旧锁；锁定开始：{self._format_time(lock_started)}")
         if not self._running_lock.acquire(blocking=False):
@@ -351,29 +383,22 @@ class Instant115(_PluginBase):
         if not local_path.exists():
             self._write_record(torrent_hash, name, "failed", reason=f"本地路径不存在：{local_path}")
             return
-        logger.info(f"秒传115开始处理：{name}，先进行秒传预检，预检通过前不创建 115 目标文件夹")
-        self._write_record(torrent_hash, name, "checking", reason="正在进行秒传预检")
-        ok, file_count, reason = self._precheck_path_instant(u115, local_path)
+        logger.info(f"秒传115开始处理：{name}，先构建文件特征缓存，再写入目标目录")
+        self._write_record(torrent_hash, name, "checking", reason="正在计算 SHA1/preid/size 缓存")
+        ok, file_count, reason, instant_cache = self._build_instant_cache(local_path)
         if not ok:
-            if reason == "non_instant_upload_required":
-                records = self._load_records()
-                retry = int((records.get(torrent_hash) or {}).get("retry", 0) or 0) + 1
-                if self._max_retry and retry > self._max_retry:
-                    self._write_record(torrent_hash, name, "failed", retry=retry, reason="超过最大重试次数")
-                    return
-                cooldown_until = int(time.time()) + self._cooldown_minutes * 60
-                self._write_record(torrent_hash, name, "cooldown", retry=retry, cooldown_until=cooldown_until, reason=f"检测到需要 115 分片上传，已跳过并冷却至 {self._format_time(cooldown_until)}")
-                logger.warning(f"秒传115预检发现需要 115 分片上传，未创建目标文件夹并已冷却：{name}")
-                return
             self._write_record(torrent_hash, name, "failed", reason=reason)
             return
-        target_dir = u115.get_folder(Path(self._target_path) / self._safe_name(name))
+        target_path = Path(self._target_path) / self._safe_name(name)
+        existed_dir = u115.get_item(target_path)
+        target_dir = u115.get_folder(target_path)
+        created_by_plugin = not bool(existed_dir) and bool(target_dir)
         if not target_dir:
-            self._write_record(torrent_hash, name, "failed", reason="秒传预检通过，但创建 115 同名目录失败")
+            self._write_record(torrent_hash, name, "failed", reason="创建 115 同名目录失败")
             return
-        logger.info(f"秒传115预检通过，开始创建目标目录并秒传：{name} -> {target_dir.path}")
-        self._write_record(torrent_hash, name, "uploading", reason=f"秒传预检通过，准备写入 {file_count} 个文件")
-        ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, torrent_hash)
+        logger.info(f"秒传115开始向目标目录秒传写入：{name} -> {target_dir.path}，目录为{'本轮新建' if created_by_plugin else '已存在'}")
+        self._write_record(torrent_hash, name, "uploading", reason=f"文件特征缓存完成，准备写入 {file_count} 个文件")
+        ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, torrent_hash, instant_cache)
         if ok:
             self._write_record(torrent_hash, name, "uploaded", files=file_count, reason=reason)
             self._tag_uploaded_torrent(torrent)
@@ -388,51 +413,61 @@ class Instant115(_PluginBase):
             cooldown_until = int(time.time()) + self._cooldown_minutes * 60
             self._write_record(torrent_hash, name, "cooldown", retry=retry, cooldown_until=cooldown_until, reason=f"检测到需要 115 分片上传，已跳过并冷却至 {self._format_time(cooldown_until)}")
             logger.warning(f"秒传115检测到需要 115 分片上传，已跳过并冷却：{name}")
+            self._cleanup_created_empty_dir(u115, target_dir, created_by_plugin)
             return
         self._write_record(torrent_hash, name, "failed", reason=reason)
+        self._cleanup_created_empty_dir(u115, target_dir, created_by_plugin)
 
 
-    def _precheck_path_instant(self, u115: U115Pan, local_path: Path) -> Tuple[bool, int, str]:
-        """预检查路径内所有文件是否都支持 115 秒传。"""
+    def _build_instant_cache(self, local_path: Path) -> Tuple[bool, int, str, Dict[str, Dict[str, Any]]]:
+        """计算路径内所有文件的 SHA1、preid 和 size 缓存，不调用 115 上传接口。"""
         try:
             files = [local_path] if local_path.is_file() else [Path(root) / name for root, _, names in os.walk(local_path) for name in names]
             if not files:
-                return False, 0, "没有可上传文件"
-            logger.info(f"秒传115开始秒传预检：{local_path}，文件数：{len(files)}")
+                return False, 0, "没有可上传文件", {}
+            instant_cache: Dict[str, Dict[str, Any]] = {}
+            logger.info(f"秒传115开始构建秒传缓存：{local_path}，文件数：{len(files)}")
+            u115 = U115Pan()
             for index, file_path in enumerate(files, 1):
-                logger.info(f"秒传115预检文件 {index}/{len(files)}：{file_path}")
-                if not self._check_file_instant_available(u115, file_path):
-                    logger.warning(f"秒传115预检失败，文件需要 115 分片上传：{file_path}")
-                    return False, 0, "non_instant_upload_required"
-            logger.info(f"秒传115秒传预检通过：{local_path}，文件数：{len(files)}")
-            return True, len(files), "秒传预检通过"
-        except LocalUploadRequiredError:
-            return False, 0, "non_instant_upload_required"
+                logger.info(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
+                file_size = file_path.stat().st_size
+                file_sha1 = u115._calc_sha1(file_path)
+                file_preid = u115._calc_sha1(file_path, 128 * 1024 * 1024)
+                instant_cache[file_path.as_posix()] = {
+                    "file_name": file_path.name,
+                    "file_size": file_size,
+                    "file_sha1": file_sha1,
+                    "file_preid": file_preid,
+                }
+            logger.info(f"秒传115文件特征缓存完成：{local_path}，文件数：{len(files)}")
+            return True, len(files), "文件特征缓存完成", instant_cache
         except Exception as err:
-            logger.exception(f"秒传115秒传预检异常：{err}")
-            return False, 0, str(err)
+            logger.exception(f"秒传115构建秒传缓存异常：{err}")
+            return False, 0, str(err), {}
 
-    def _check_file_instant_available(self, u115: U115Pan, local_path: Path) -> bool:
-        """检查单个文件是否可被 115 秒传，不创建最终目录。"""
-        file_size = local_path.stat().st_size
-        file_sha1 = u115._calc_sha1(local_path)
-        file_preid = u115._calc_sha1(local_path, 128 * 1024 * 1024)
-        target_cid = self._get_precheck_target_cid(u115)
-        init_data = {"file_name": local_path.name, "file_size": file_size, "target": f"U_1_{target_cid}", "fileid": file_sha1, "preid": file_preid}
-        init_resp = u115._request_api("POST", "/open/upload/init", data=init_data)
-        if not init_resp or not init_resp.get("state"):
-            logger.warning(f"【115】预检初始化上传失败：{local_path.name} - {init_resp}")
+    @staticmethod
+    def _is_remote_dir_empty(u115: U115Pan, target_dir) -> bool:
+        """判断 115 目录是否为空。"""
+        try:
+            return len(u115.list(target_dir) or []) == 0
+        except Exception as err:
+            logger.warning(f"秒传115检查 115 目录是否为空失败：{target_dir.path} - {err}")
             return False
-        init_result = init_resp.get("data") or {}
-        init_result = self._handle_115_sign_check(u115, local_path, init_data, init_result)
-        return bool(init_result and init_result.get("status") == 2)
 
-    def _get_precheck_target_cid(self, u115: U115Pan) -> str:
-        """获取 115 秒传预检使用的目标目录 CID。"""
-        target_root = u115.get_item(Path(self._target_path)) or u115.get_folder(Path(self._target_path))
-        if not target_root:
-            raise RuntimeError(f"获取 115 预检目录失败：{self._target_path}")
-        return target_root.fileid
+    def _cleanup_created_empty_dir(self, u115: U115Pan, target_dir, created_by_plugin: bool) -> None:
+        """清理本轮插件创建且仍为空的 115 目标目录。"""
+        if not created_by_plugin or not target_dir:
+            return
+        try:
+            if self._is_remote_dir_empty(u115, target_dir):
+                if u115.delete(target_dir):
+                    logger.info(f"秒传115已清理本轮创建的空目录：{target_dir.path}")
+                else:
+                    logger.warning(f"秒传115清理空目录失败：{target_dir.path}")
+            else:
+                logger.info(f"秒传115目标目录非空，不执行清理：{target_dir.path}")
+        except Exception as err:
+            logger.warning(f"秒传115清理空目录异常：{target_dir.path} - {err}")
 
     def _handle_115_sign_check(self, u115: U115Pan, local_path: Path, init_data: Dict[str, Any], init_result: Dict[str, Any]) -> Dict[str, Any]:
         """处理 115 上传初始化的二次认证。"""
@@ -457,11 +492,11 @@ class Instant115(_PluginBase):
             return {}
         return init_resp.get("data") or {}
 
-    def _upload_path_with_guard(self, u115: U115Pan, target_dir, local_path: Path, task_key: str) -> Tuple[bool, int, str]:
+    def _upload_path_with_guard(self, u115: U115Pan, target_dir, local_path: Path, task_key: str, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int, str]:
         """上传路径并在进入分片上传前取消。"""
         del task_key
         try:
-            ok, count = self._upload_path(u115, target_dir, local_path)
+            ok, count = self._upload_path(u115, target_dir, local_path, instant_cache)
             return ok, count, "秒传成功" if ok else "上传失败"
         except LocalUploadRequiredError:
             return False, 0, "non_instant_upload_required"
@@ -469,10 +504,10 @@ class Instant115(_PluginBase):
             logger.exception(f"秒传115上传异常：{err}")
             return False, 0, str(err)
 
-    def _upload_path(self, u115: U115Pan, target_dir, local_path: Path) -> Tuple[bool, int]:
-        """上传单个文件或目录。"""
+    def _upload_path(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int]:
+        """使用预检缓存秒传单个文件或目录。"""
         if local_path.is_file():
-            return (self._upload_file_instant_only(u115, target_dir, local_path) is not None), 1
+            return (self._upload_file_instant_only(u115, target_dir, local_path, instant_cache) is not None), 1
         file_count = 0
         failed = 0
         folder_cache = {".": target_dir}
@@ -489,20 +524,23 @@ class Instant115(_PluginBase):
                 continue
             for filename in files:
                 file_path = root_path / filename
-                if self._upload_file_instant_only(u115, remote_dir, file_path):
+                if self._upload_file_instant_only(u115, remote_dir, file_path, instant_cache):
                     file_count += 1
                 else:
                     failed += 1
         return failed == 0 and file_count > 0, file_count
 
 
-    def _upload_file_instant_only(self, u115: U115Pan, target_dir, local_path: Path):
-        """只执行 115 秒传，检测到需要 OSS 分片上传时抛出冷却异常。"""
+    def _upload_file_instant_only(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]):
+        """复用预检缓存执行 115 秒传，检测到需要 OSS 分片上传时抛出冷却异常。"""
         target_name = local_path.name
         target_path = Path(target_dir.path) / target_name
-        file_size = local_path.stat().st_size
-        file_sha1 = u115._calc_sha1(local_path)
-        file_preid = u115._calc_sha1(local_path, 128 * 1024 * 1024)
+        meta = instant_cache.get(local_path.as_posix())
+        if not meta:
+            raise RuntimeError(f"缺少秒传预检缓存：{local_path}")
+        file_size = int(meta["file_size"])
+        file_sha1 = str(meta["file_sha1"])
+        file_preid = str(meta["file_preid"])
         init_data = {
             "file_name": target_name,
             "file_size": file_size,
