@@ -16,14 +16,15 @@
   },
   "Instant115": {
     "name": "秒传115",
-    "description": "监控 qBittorrent 完成任务，先计算并缓存 SHA1/preid/size，再写入 115 目标文件夹；检测到需要分片上传时自动跳过、冷却并清理本轮新建空目录。",
+    "description": "监控 qBittorrent 完成任务，支持按 qB 标签映射到不同 115 目录；先计算并缓存 SHA1/preid/size，再写入 115 目标文件夹。",
     "labels": "网盘,115,qBittorrent",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "upload_a.png",
     "author": "local",
     "level": 1,
     "system_version": ">=2.12.0",
     "history": {
+      "v1.2.0": "新增按 qB 标签映射不同 115 目标目录功能，支持一行一条 标签 => 目录，按配置顺序优先匹配。",
       "v1.1.0": "扫描调度由固定分钟间隔改为 Cron 表达式，默认 */10 * * * *。",
       "v1.0.9": "优化 JSON 配置页排版，按开关、路径标签、调度重试、维护说明分组展示。",
       "v1.0.8": "采用方案 B：先创建最终目标目录再用缓存写入；不再用 /PT 做预检 target，非秒传时只清理本轮新建且为空的目标目录。",
