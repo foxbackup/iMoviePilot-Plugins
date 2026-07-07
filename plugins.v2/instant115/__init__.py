@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import global_vars, settings
 from app.helper.downloader import DownloaderHelper
@@ -29,7 +29,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -43,7 +43,7 @@ class Instant115(_PluginBase):
     _skip_tags = "已上传115"
     _uploaded_tag = "已上传115"
     _cooldown_minutes = 30
-    _scan_interval = 10
+    _cron = "*/10 * * * *"
     _max_retry = 0
     _max_tasks_per_scan = 3
     _record_keep_days = 30
@@ -68,7 +68,7 @@ class Instant115(_PluginBase):
         self._skip_tags = "已上传115"
         self._uploaded_tag = "已上传115"
         self._cooldown_minutes = 30
-        self._scan_interval = 10
+        self._cron = "*/10 * * * *"
         self._max_retry = 0
         self._max_tasks_per_scan = 3
         self._record_keep_days = 30
@@ -82,7 +82,7 @@ class Instant115(_PluginBase):
             self._skip_tags = str(config.get("skip_tags") or "")
             self._uploaded_tag = str(config.get("uploaded_tag") or "已上传115")
             self._cooldown_minutes = max(1, int(config.get("cooldown_minutes") or 30))
-            self._scan_interval = max(1, int(config.get("scan_interval") or 10))
+            self._cron = str(config.get("cron") or config.get("scan_cron") or "*/10 * * * *").strip()
             self._max_retry = max(0, int(config.get("max_retry") or 0))
             self._max_tasks_per_scan = max(1, int(config.get("max_tasks_per_scan") or 3))
             self._record_keep_days = max(1, int(config.get("record_keep_days") or 30))
@@ -147,7 +147,7 @@ class Instant115(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "scan_interval", "label": "扫描间隔（分钟）", "type": "number", "min": 1}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cron", "label": "扫描 Cron", "placeholder": "*/10 * * * *", "hint": "五位 cron 表达式，例如 */10 * * * * 表示每 10 分钟。", "persistent-hint": True}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_tasks_per_scan", "label": "每轮最多处理任务数", "type": "number", "min": 1}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cooldown_minutes", "label": "冷却重试（分钟）", "type": "number", "min": 1, "hint": "检测到需要 115 分片上传时进入冷却。", "persistent-hint": True}}]},
                         ],
@@ -220,7 +220,12 @@ class Instant115(_PluginBase):
         """注册定时扫描服务。"""
         if not self._enabled:
             return []
-        return [{"id": "Instant115", "name": "秒传115扫描", "trigger": IntervalTrigger(minutes=self._scan_interval), "func": self.scan_and_upload, "kwargs": {}}]
+        try:
+            trigger = CronTrigger.from_crontab(self._cron)
+        except Exception as err:
+            logger.error(f"秒传115 Cron 表达式无效：{self._cron} - {err}")
+            return []
+        return [{"id": "Instant115", "name": "秒传115扫描", "trigger": trigger, "func": self.scan_and_upload, "kwargs": {}}]
 
     def stop_service(self) -> None:
         """停止插件后台调度器并取消插件内检测事件。"""
@@ -664,7 +669,7 @@ class Instant115(_PluginBase):
 
     def _current_config(self) -> Dict[str, Any]:
         """返回当前配置。"""
-        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "cooldown_minutes": self._cooldown_minutes, "scan_interval": self._scan_interval, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "clear_records": False}
+        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "cooldown_minutes": self._cooldown_minutes, "cron": self._cron, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "clear_records": False}
 
     def _save_config(self) -> None:
         """保存当前配置。"""
