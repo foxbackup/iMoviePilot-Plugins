@@ -29,7 +29,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -42,6 +42,7 @@ class Instant115(_PluginBase):
     _target_path = "/PT"
     _skip_tags = "已上传115"
     _uploaded_tag = "已上传115"
+    _tag_path_mappings = ""
     _cooldown_minutes = 30
     _cron = "*/10 * * * *"
     _max_retry = 0
@@ -67,6 +68,7 @@ class Instant115(_PluginBase):
         self._target_path = "/PT"
         self._skip_tags = "已上传115"
         self._uploaded_tag = "已上传115"
+        self._tag_path_mappings = ""
         self._cooldown_minutes = 30
         self._cron = "*/10 * * * *"
         self._max_retry = 0
@@ -81,6 +83,7 @@ class Instant115(_PluginBase):
             self._target_path = str(config.get("target_path") or "/PT")
             self._skip_tags = str(config.get("skip_tags") or "")
             self._uploaded_tag = str(config.get("uploaded_tag") or "已上传115")
+            self._tag_path_mappings = str(config.get("tag_path_mappings") or "")
             self._cooldown_minutes = max(1, int(config.get("cooldown_minutes") or 30))
             self._cron = str(config.get("cron") or config.get("scan_cron") or "*/10 * * * *").strip()
             self._max_retry = max(0, int(config.get("max_retry") or 0))
@@ -141,6 +144,12 @@ class Instant115(_PluginBase):
                         "component": "VRow",
                         "content": [
                             {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "skip_tags", "label": "跳过的 qB 标签", "placeholder": "多个标签用英文逗号分隔，如：MOVIEPILOT,已上传115", "hint": "任务包含任意一个标签时跳过，不进入队列。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "tag_path_mappings", "label": "标签目标目录映射", "placeholder": "ADE => /PT/ADE\naudiences => /PT/Audiences", "rows": 4, "auto-grow": True, "hint": "一行一条，格式：标签 => 115目录。任务有多个标签时从上到下第一条命中生效；未命中则使用默认目标目录。", "persistent-hint": True}}]},
                         ],
                     },
                     {"component": "VDivider", "props": {"class": "my-3"}},
@@ -380,6 +389,34 @@ class Instant115(_PluginBase):
             return False, f"本地路径不存在：{local_path}"
         return True, "符合规则"
 
+
+    def _parse_tag_path_mappings(self) -> List[Tuple[str, str]]:
+        """解析 qB 标签到 115 目录的映射配置。"""
+        mappings: List[Tuple[str, str]] = []
+        for raw_line in str(self._tag_path_mappings or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=>" not in line:
+                logger.warning(f"秒传115忽略无效标签目录映射：{line}")
+                continue
+            tag, path = [part.strip() for part in line.split("=>", 1)]
+            if not tag or not path:
+                logger.warning(f"秒传115忽略不完整标签目录映射：{line}")
+                continue
+            mappings.append((tag, path))
+        return mappings
+
+    def _resolve_target_path(self, torrent) -> str:
+        """根据 qB 标签解析当前任务应使用的 115 目标目录。"""
+        tags = {tag.strip() for tag in str(getattr(torrent, "tags", "") or "").split(",") if tag.strip()}
+        for tag, path in self._parse_tag_path_mappings():
+            if tag in tags:
+                logger.info(f"秒传115任务命中标签路径映射：{getattr(torrent, 'name', '')} | {tag} => {path}")
+                return path
+        logger.info(f"秒传115任务未命中标签路径映射，使用默认目录：{getattr(torrent, 'name', '')} -> {self._target_path}")
+        return self._target_path
+
     def _process_torrent(self, u115: U115Pan, torrent) -> None:
         """处理单个 qBittorrent 任务。"""
         torrent_hash = torrent.hash
@@ -394,7 +431,8 @@ class Instant115(_PluginBase):
         if not ok:
             self._write_record(torrent_hash, name, "failed", reason=reason)
             return
-        target_path = Path(self._target_path) / self._safe_name(name)
+        base_target_path = self._resolve_target_path(torrent)
+        target_path = Path(base_target_path) / self._safe_name(name)
         existed_dir = u115.get_item(target_path)
         target_dir = u115.get_folder(target_path)
         created_by_plugin = not bool(existed_dir) and bool(target_dir)
@@ -669,7 +707,7 @@ class Instant115(_PluginBase):
 
     def _current_config(self) -> Dict[str, Any]:
         """返回当前配置。"""
-        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "cooldown_minutes": self._cooldown_minutes, "cron": self._cron, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "clear_records": False}
+        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "tag_path_mappings": self._tag_path_mappings, "cooldown_minutes": self._cooldown_minutes, "cron": self._cron, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "clear_records": False}
 
     def _save_config(self) -> None:
         """保存当前配置。"""
