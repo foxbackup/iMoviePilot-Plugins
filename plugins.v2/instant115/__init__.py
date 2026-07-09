@@ -12,6 +12,8 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.chain.media import MediaChain
+from app.modules.filemanager import FileManagerModule
 from app.core.config import global_vars, settings
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -30,7 +32,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -51,10 +53,13 @@ class Instant115(_PluginBase):
     _record_keep_days = 30
     _clear_records = False
     _running_lock_timeout_minutes = 180
+    _smart_rename = False
+    _smart_rename_fallback = True
 
     _record_key = "records"
     _runtime_key = "runtime"
     _queue_key = "queue"
+    _instant_cache_key = "instant_cache"
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
     _running_lock = threading.Lock()
@@ -77,6 +82,8 @@ class Instant115(_PluginBase):
         self._record_keep_days = 30
         self._clear_records = False
         self._running_lock_timeout_minutes = 180
+        self._smart_rename = False
+        self._smart_rename_fallback = True
         if config:
             self._enabled = bool(config.get("enabled", False))
             self._onlyonce = bool(config.get("onlyonce", False))
@@ -92,6 +99,8 @@ class Instant115(_PluginBase):
             self._record_keep_days = max(1, int(config.get("record_keep_days") or 30))
             self._running_lock_timeout_minutes = max(10, int(config.get("running_lock_timeout_minutes") or 180))
             self._clear_records = bool(config.get("clear_records", False))
+            self._smart_rename = bool(config.get("smart_rename", False))
+            self._smart_rename_fallback = bool(config.get("smart_rename_fallback", True))
         if self._clear_records:
             self.del_data(self._record_key)
             self._clear_records = False
@@ -168,6 +177,14 @@ class Instant115(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_retry", "label": "最大重试次数", "type": "number", "min": 0, "hint": "0 表示不限次数。", "persistent-hint": True}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "record_keep_days", "label": "记录保留天数", "type": "number", "min": 1}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "running_lock_timeout_minutes", "label": "运行锁超时（分钟）", "type": "number", "min": 10, "hint": "异常中断或热重载后，超过该时间自动释放运行锁。", "persistent-hint": True}}]},
+                        ],
+                    },
+                    {"component": "VDivider", "props": {"class": "my-3"}},
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"model": "smart_rename", "label": "上传前使用 MoviePilot 智能重命名", "hint": "仅改变提交给 115 /open/upload/init 的 file_name，本地文件名不变。", "persistent-hint": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"model": "smart_rename_fallback", "label": "智能命名失败时回退原文件名", "hint": "关闭后智能命名失败会直接使该文件上传失败。", "persistent-hint": True}}]},
                         ],
                     },
                     {"component": "VDivider", "props": {"class": "my-3"}},
@@ -444,6 +461,7 @@ class Instant115(_PluginBase):
         self._write_record(torrent_hash, name, "uploading", reason=f"文件特征缓存完成，准备写入 {file_count} 个文件")
         ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, torrent_hash, instant_cache)
         if ok:
+            self._clear_instant_cache_for_path(local_path)
             self._write_record(torrent_hash, name, "uploaded", files=file_count, reason=reason)
             self._tag_uploaded_torrent(torrent)
             self._notify_msg("秒传115上传完成", f"{name}\n文件数：{file_count}\n结果：{reason}")
@@ -464,30 +482,96 @@ class Instant115(_PluginBase):
 
 
     def _build_instant_cache(self, local_path: Path) -> Tuple[bool, int, str, Dict[str, Dict[str, Any]]]:
-        """计算路径内所有文件的 SHA1、preid 和 size 缓存，不调用 115 上传接口。"""
+        """构建或复用路径内所有文件的 SHA1、preid 和 size 秒传缓存。"""
         try:
             files = [local_path] if local_path.is_file() else [Path(root) / name for root, _, names in os.walk(local_path) for name in names]
             if not files:
                 return False, 0, "没有可上传文件", {}
+            self._cleanup_old_instant_cache()
+            persisted_cache = self._load_instant_cache()
             instant_cache: Dict[str, Dict[str, Any]] = {}
+            changed = False
+            reused = 0
+            calculated = 0
             logger.info(f"秒传115开始构建秒传缓存：{local_path}，文件数：{len(files)}")
             u115 = U115Pan()
             for index, file_path in enumerate(files, 1):
+                file_key = file_path.as_posix()
+                stat = file_path.stat()
+                file_size = int(stat.st_size)
+                file_mtime = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)))
+                cached = persisted_cache.get(file_key) if isinstance(persisted_cache.get(file_key), dict) else None
+                if cached and int(cached.get("file_size", -1) or -1) == file_size and int(cached.get("mtime", -1) or -1) == file_mtime and cached.get("file_sha1") and cached.get("file_preid"):
+                    logger.info(f"秒传115复用文件特征缓存 {index}/{len(files)}：{file_path}")
+                    item = dict(cached)
+                    item.update({"file_name": file_path.name, "file_size": file_size, "mtime": file_mtime, "time": int(time.time())})
+                    persisted_cache[file_key] = item
+                    instant_cache[file_key] = item
+                    reused += 1
+                    changed = True
+                    continue
                 logger.info(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
-                file_size = file_path.stat().st_size
                 file_sha1 = u115._calc_sha1(file_path)
                 file_preid = u115._calc_sha1(file_path, 128 * 1024 * 1024)
-                instant_cache[file_path.as_posix()] = {
+                item = {
                     "file_name": file_path.name,
                     "file_size": file_size,
+                    "mtime": file_mtime,
                     "file_sha1": file_sha1,
                     "file_preid": file_preid,
+                    "time": int(time.time()),
                 }
-            logger.info(f"秒传115文件特征缓存完成：{local_path}，文件数：{len(files)}")
-            return True, len(files), "文件特征缓存完成", instant_cache
+                instant_cache[file_key] = item
+                persisted_cache[file_key] = item
+                calculated += 1
+                changed = True
+            if changed:
+                self.save_data(self._instant_cache_key, persisted_cache)
+            logger.info(f"秒传115文件特征缓存完成：{local_path}，文件数：{len(files)}，复用：{reused}，新算：{calculated}")
+            return True, len(files), f"文件特征缓存完成，复用 {reused} 个，新算 {calculated} 个", instant_cache
         except Exception as err:
             logger.error(f"秒传115构建秒传缓存异常：{err}\n{traceback.format_exc()}")
             return False, 0, str(err), {}
+
+    def _load_instant_cache(self) -> Dict[str, Dict[str, Any]]:
+        """读取持久化秒传文件特征缓存。"""
+        data = self.get_data(self._instant_cache_key)
+        return data if isinstance(data, dict) else {}
+
+    def _cleanup_old_instant_cache(self) -> None:
+        """按记录保留天数清理过期秒传文件特征缓存。"""
+        cache = self._load_instant_cache()
+        if not cache:
+            return
+        expire_before = int(time.time()) - self._record_keep_days * 86400
+        new_cache = {}
+        for key, item in cache.items():
+            if not isinstance(item, dict):
+                continue
+            if int(item.get("time", 0) or 0) < expire_before:
+                continue
+            if not Path(key).exists():
+                continue
+            new_cache[key] = item
+        if len(new_cache) != len(cache):
+            self.save_data(self._instant_cache_key, new_cache)
+            logger.info(f"秒传115已清理过期文件特征缓存：{len(cache) - len(new_cache)} 条")
+
+    def _clear_instant_cache_for_path(self, local_path: Path) -> None:
+        """秒传成功后删除当前任务涉及文件的特征缓存。"""
+        cache = self._load_instant_cache()
+        if not cache:
+            return
+        files = [local_path] if local_path.is_file() else [Path(root) / name for root, _, names in os.walk(local_path) for name in names]
+        keys = {file_path.as_posix() for file_path in files}
+        removed = 0
+        for key in list(keys):
+            if key in cache:
+                cache.pop(key, None)
+                removed += 1
+        if removed:
+            self.save_data(self._instant_cache_key, cache)
+            logger.info(f"秒传115已删除秒传成功任务的文件特征缓存：{removed} 条")
 
     @staticmethod
     def _is_remote_dir_empty(u115: U115Pan, target_dir) -> bool:
@@ -578,15 +662,16 @@ class Instant115(_PluginBase):
     def _upload_file_instant_only(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]):
         """复用预检缓存执行 115 秒传，检测到需要 OSS 分片上传时抛出冷却异常。"""
         target_name = local_path.name
-        target_path = Path(target_dir.path) / target_name
         meta = instant_cache.get(local_path.as_posix())
         if not meta:
             raise RuntimeError(f"缺少秒传预检缓存：{local_path}")
         file_size = int(meta["file_size"])
         file_sha1 = str(meta["file_sha1"])
         file_preid = str(meta["file_preid"])
+        upload_name = self._resolve_upload_file_name(local_path, target_name)
+        target_path = Path(target_dir.path) / upload_name
         init_data = {
-            "file_name": target_name,
+            "file_name": upload_name,
             "file_size": file_size,
             "target": f"U_1_{target_dir.fileid}",
             "fileid": file_sha1,
@@ -599,7 +684,7 @@ class Instant115(_PluginBase):
         init_result = init_resp.get("data") or {}
         init_result = self._handle_115_sign_check(u115, local_path, init_data, init_result)
         if init_result.get("status") == 2:
-            logger.info(f"【115】{target_name} 秒传成功")
+            logger.info(f"【115】{target_name} 秒传成功，115 文件名：{upload_name}")
             time.sleep(2)
             uploaded_item = u115.get_item(target_path)
             if uploaded_item:
@@ -607,6 +692,31 @@ class Instant115(_PluginBase):
             return u115._U115Pan__build_uploaded_fileitem(target_path, local_path, file_size)
         logger.warning(f"秒传115检测到 {target_name} 需要进入 115 分片上传，立即跳过并冷却")
         raise LocalUploadRequiredError(target_name)
+
+    def _resolve_upload_file_name(self, local_path: Path, original_name: str) -> str:
+        """解析提交给 115 上传初始化接口的文件名。"""
+        if not self._smart_rename:
+            return original_name
+        try:
+            context = MediaChain().recognize_by_path(local_path.as_posix())
+            meta = getattr(context, "meta_info", None) if context else None
+            mediainfo = getattr(context, "media_info", None) if context else None
+            if not meta or not mediainfo:
+                raise ValueError("未识别到完整媒体信息")
+            recommend_name = FileManagerModule.recommend_name(meta=meta, mediainfo=mediainfo)
+            if not recommend_name:
+                raise ValueError("MoviePilot 未生成推荐文件名")
+            upload_name = Path(str(recommend_name)).name
+            if not upload_name:
+                raise ValueError(f"推荐文件名无效：{recommend_name}")
+            logger.info(f"秒传115智能重命名：{local_path.name} -> {upload_name}")
+            return upload_name
+        except Exception as err:
+            logger.warning(f"秒传115智能重命名失败：{local_path} - {err}")
+            if self._smart_rename_fallback:
+                logger.info(f"秒传115智能重命名失败，按配置回退原文件名：{original_name}")
+                return original_name
+            raise
 
     @staticmethod
     def _is_completed(torrent) -> bool:
@@ -708,7 +818,7 @@ class Instant115(_PluginBase):
 
     def _current_config(self) -> Dict[str, Any]:
         """返回当前配置。"""
-        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "tag_path_mappings": self._tag_path_mappings, "cooldown_minutes": self._cooldown_minutes, "cron": self._cron, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "clear_records": False}
+        return {"enabled": self._enabled, "onlyonce": False, "notify": self._notify, "target_path": self._target_path, "skip_tags": self._skip_tags, "uploaded_tag": self._uploaded_tag, "tag_path_mappings": self._tag_path_mappings, "cooldown_minutes": self._cooldown_minutes, "cron": self._cron, "max_retry": self._max_retry, "max_tasks_per_scan": self._max_tasks_per_scan, "record_keep_days": self._record_keep_days, "running_lock_timeout_minutes": self._running_lock_timeout_minutes, "smart_rename": self._smart_rename, "smart_rename_fallback": self._smart_rename_fallback, "clear_records": False}
 
     def _save_config(self) -> None:
         """保存当前配置。"""
