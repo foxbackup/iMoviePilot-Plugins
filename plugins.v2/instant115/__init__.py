@@ -2,6 +2,7 @@ import os
 import copy
 import re
 import threading
+import traceback
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,7 +30,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -308,7 +309,7 @@ class Instant115(_PluginBase):
                 self._process_torrent(u115, item.get('torrent'))
             self._save_queue(queue[self._max_tasks_per_scan:])
         except Exception as err:
-            logger.exception(f"秒传115扫描异常：{err}")
+            logger.error(f"秒传115扫描异常：{err}\n{traceback.format_exc()}")
         finally:
             self._release_running_lock()
 
@@ -485,7 +486,7 @@ class Instant115(_PluginBase):
             logger.info(f"秒传115文件特征缓存完成：{local_path}，文件数：{len(files)}")
             return True, len(files), "文件特征缓存完成", instant_cache
         except Exception as err:
-            logger.exception(f"秒传115构建秒传缓存异常：{err}")
+            logger.error(f"秒传115构建秒传缓存异常：{err}\n{traceback.format_exc()}")
             return False, 0, str(err), {}
 
     @staticmethod
@@ -544,7 +545,7 @@ class Instant115(_PluginBase):
         except LocalUploadRequiredError:
             return False, 0, "non_instant_upload_required"
         except Exception as err:
-            logger.exception(f"秒传115上传异常：{err}")
+            logger.error(f"秒传115上传异常：{err}\n{traceback.format_exc()}")
             return False, 0, str(err)
 
     def _upload_path(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int]:
