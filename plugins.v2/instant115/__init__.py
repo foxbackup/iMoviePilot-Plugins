@@ -14,7 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.chain.media import MediaChain
 from app.modules.filemanager import FileManagerModule
-from app.core.config import global_vars, settings
+from app.core.config import settings
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.modules.filemanager.storages.u115 import U115Pan
@@ -30,9 +30,9 @@ class Instant115(_PluginBase):
     """秒传115插件。"""
 
     plugin_name = "秒传115"
-    plugin_desc = "监控 qBittorrent 完成任务，先全量筛选队列，只接受 115 秒传；检测到需要分片上传时自动跳过并冷却重试。"
+    plugin_desc = "监控 qBittorrent 完成任务，支持按标签映射 115 目录、MoviePilot 智能重命名与 SHA1/preid 秒传缓存，只接受 115 秒传，非秒传自动冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -252,7 +252,7 @@ class Instant115(_PluginBase):
         except Exception as err:
             logger.error(f"秒传115 Cron 表达式无效：{self._cron} - {err}")
             return []
-        return [{"id": "Instant115", "name": "秒传115扫描", "trigger": trigger, "func": self.scan_and_upload, "kwargs": {}}]
+        return [{"id": self.__class__.__name__, "name": "秒传115扫描", "trigger": trigger, "func": self.scan_and_upload, "kwargs": {}}]
 
     def stop_service(self) -> None:
         """停止插件后台调度器并取消插件内检测事件。"""
@@ -750,39 +750,6 @@ class Instant115(_PluginBase):
         except Exception as err:
             logger.error(f"秒传115初始化 115 失败：{err}")
         return None
-
-    @staticmethod
-    def _process_sent_bytes() -> int:
-        """统计当前进程及子进程累计发送字节。"""
-        total = 0
-        try:
-            proc = psutil.Process(os.getpid())
-            procs = [proc] + proc.children(recursive=True)
-            for item in procs:
-                try:
-                    counters = item.net_io_counters()
-                    total += int(getattr(counters, "bytes_sent", 0) or 0)
-                except Exception:
-                    continue
-        except Exception:
-            try:
-                total = int(psutil.net_io_counters().bytes_sent)
-            except Exception:
-                total = 0
-        return total
-
-    @staticmethod
-    def _cancel_upload(local_path: Path) -> None:
-        """取消当前插件提交的 115 上传任务。"""
-        for method_name in ("set_transfer_stop", "set_transfer_stopped"):
-            method = getattr(global_vars, method_name, None)
-            if callable(method):
-                try:
-                    method(local_path.as_posix())
-                    return
-                except Exception:
-                    continue
-        logger.warning("秒传115未找到可用的上传取消接口")
 
     def _tag_uploaded_torrent(self, torrent) -> None:
         """上传成功后给 qBittorrent 种子添加标签。"""
