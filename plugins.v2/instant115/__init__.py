@@ -26,13 +26,21 @@ class LocalUploadRequiredError(Exception):
     """需要本地分片上传异常。"""
 
 
+class Transient115Error(Exception):
+    """115 临时错误异常，可稍后重试。"""
+
+
+class PermanentUploadError(Exception):
+    """永久上传错误异常，需要人工处理。"""
+
+
 class Instant115(_PluginBase):
     """秒传115插件。"""
 
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，支持按标签映射 115 目录、MoviePilot 智能重命名与 SHA1/preid 秒传缓存，只接受 115 秒传，非秒传自动冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.3.2"
+    plugin_version = "1.4.0"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -60,6 +68,7 @@ class Instant115(_PluginBase):
     _runtime_key = "runtime"
     _queue_key = "queue"
     _instant_cache_key = "instant_cache"
+    _manifest_key = "manifests"
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
     _running_lock = threading.Lock()
@@ -450,15 +459,15 @@ class Instant115(_PluginBase):
         return "/" + "/".join(parts) if parts else "/"
 
     def _process_torrent(self, u115: U115Pan, torrent) -> None:
-        """处理单个 qBittorrent 任务。"""
+        """处理单个 qBittorrent 任务并支持文件级断点恢复。"""
         torrent_hash = torrent.hash
         name = torrent.name or torrent_hash
         local_path = Path(torrent.content_path or torrent.save_path or "")
         if not local_path.exists():
             self._write_record(torrent_hash, name, "failed", reason=f"本地路径不存在：{local_path}")
             return
-        logger.info(f"秒传115开始处理：{name}，先构建文件特征缓存，再写入目标目录")
-        self._write_record(torrent_hash, name, "checking", reason="正在计算 SHA1/preid/size 缓存")
+        logger.info(f"秒传115开始处理：{name}，构建任务清单并恢复文件级状态")
+        self._write_record(torrent_hash, name, "checking", reason="正在构建 manifest 和 SHA1/preid/size 缓存")
         ok, file_count, reason, instant_cache = self._build_instant_cache(local_path)
         if not ok:
             self._write_record(torrent_hash, name, "failed", reason=reason)
@@ -471,29 +480,147 @@ class Instant115(_PluginBase):
         if not target_dir:
             self._write_record(torrent_hash, name, "failed", reason="创建 115 同名目录失败")
             return
-        logger.info(f"秒传115开始向目标目录秒传写入：{name} -> {target_dir.path}，目录为{'本轮新建' if created_by_plugin else '已存在'}")
-        self._write_record(torrent_hash, name, "uploading", reason=f"文件特征缓存完成，准备写入 {file_count} 个文件")
-        ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, instant_cache)
+        manifest = self._prepare_manifest(torrent_hash, local_path, target_dir, instant_cache)
+        pending_count = sum(1 for item in manifest if item.get("status") != "confirmed")
+        logger.info(f"秒传115任务 manifest：总数 {len(manifest)}，已确认 {len(manifest) - pending_count}，待处理 {pending_count}")
+        self._write_record(torrent_hash, name, "uploading", reason=f"准备处理 {pending_count}/{file_count} 个文件")
+        ok, confirmed_count, result_code, result_reason = self._upload_manifest(u115, target_dir, torrent_hash, manifest)
         if ok:
             self._clear_instant_cache_for_path(local_path)
-            self._write_record(torrent_hash, name, "uploaded", files=file_count, reason=reason)
+            self._delete_manifest(torrent_hash)
+            self._write_record(torrent_hash, name, "uploaded", files=confirmed_count, reason=result_reason)
             self._tag_uploaded_torrent(torrent)
-            self._notify_msg("秒传115上传完成", f"{name}\n文件数：{file_count}\n结果：{reason}")
+            self._notify_msg("秒传115上传完成", f"{name}\n文件数：{confirmed_count}\n结果：{result_reason}")
             return
-        if reason == "non_instant_upload_required":
-            records = self._load_records()
-            retry = int((records.get(torrent_hash) or {}).get("retry", 0) or 0) + 1
+        records = self._load_records()
+        retry = int((records.get(torrent_hash) or {}).get("retry", 0) or 0) + 1
+        if result_code in {"non_instant", "transient"}:
             if self._max_retry and retry > self._max_retry:
-                self._write_record(torrent_hash, name, "failed", retry=retry, reason="超过最大重试次数")
+                self._write_record(torrent_hash, name, "failed", retry=retry, reason=f"超过最大重试次数：{result_reason}")
                 return
             cooldown_until = int(time.time()) + self._cooldown_minutes * 60
-            self._write_record(torrent_hash, name, "cooldown", retry=retry, cooldown_until=cooldown_until, reason=f"检测到需要 115 分片上传，已跳过并冷却至 {self._format_time(cooldown_until)}")
-            logger.warning(f"秒传115检测到需要 115 分片上传，已跳过并冷却：{name}")
+            error_type = "非秒传" if result_code == "non_instant" else "115 临时错误"
+            self._write_record(torrent_hash, name, "cooldown", retry=retry, cooldown_until=cooldown_until, reason=f"{error_type}：{result_reason}；冷却至 {self._format_time(cooldown_until)}")
+            logger.warning(f"秒传115任务进入冷却：{name} - {error_type}：{result_reason}")
             self._cleanup_created_empty_dir(u115, target_dir, created_by_plugin)
             return
-        self._write_record(torrent_hash, name, "failed", reason=reason)
+        self._write_record(torrent_hash, name, "failed", retry=retry, reason=f"永久错误：{result_reason}")
         self._cleanup_created_empty_dir(u115, target_dir, created_by_plugin)
 
+    def _prepare_manifest(self, task_key: str, local_path: Path, target_dir, instant_cache: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """建立任务 manifest，并合并之前持久化的文件级状态。"""
+        all_manifests = self._load_manifests()
+        old_manifest = all_manifests.get(task_key) if isinstance(all_manifests.get(task_key), dict) else {}
+        old_files = old_manifest.get("files") if isinstance(old_manifest.get("files"), dict) else {}
+        files = [local_path] if local_path.is_file() else [Path(root) / name for root, _, names in os.walk(local_path) for name in names]
+        manifest: List[Dict[str, Any]] = []
+        for file_path in sorted(files, key=lambda item: item.as_posix()):
+            key = file_path.as_posix()
+            meta = instant_cache.get(key) or {}
+            relative = Path(file_path.name) if local_path.is_file() else file_path.relative_to(local_path)
+            parent_relative = relative.parent.as_posix()
+            old = old_files.get(key) if isinstance(old_files.get(key), dict) else {}
+            status = "confirmed" if old.get("status") == "confirmed" and old.get("file_sha1") == meta.get("file_sha1") and int(old.get("file_size", -1) or -1) == int(meta.get("file_size", -2) or -2) else "pending"
+            manifest.append({
+                "local_path": key, "relative_path": relative.as_posix(), "parent_relative": parent_relative,
+                "original_name": file_path.name, "upload_name": old.get("upload_name") or "",
+                "file_size": int(meta.get("file_size", 0) or 0), "file_sha1": str(meta.get("file_sha1") or ""),
+                "file_preid": str(meta.get("file_preid") or ""), "mtime": int(meta.get("mtime", 0) or 0),
+                "status": status, "remote_file_id": old.get("remote_file_id"), "remote_path": old.get("remote_path"),
+                "updated": int(time.time()),
+            })
+        self._save_manifest(task_key, target_dir.path, manifest)
+        return manifest
+
+    def _load_manifests(self) -> Dict[str, Dict[str, Any]]:
+        """读取全部任务 manifest。"""
+        data = self.get_data(self._manifest_key)
+        return data if isinstance(data, dict) else {}
+
+    def _save_manifest(self, task_key: str, target_path: str, manifest: List[Dict[str, Any]]) -> None:
+        """持久化单个任务的文件级 manifest。"""
+        all_manifests = self._load_manifests()
+        all_manifests[task_key] = {"target_path": target_path, "updated": int(time.time()), "files": {item["local_path"]: dict(item) for item in manifest}}
+        self.save_data(self._manifest_key, all_manifests)
+
+    def _delete_manifest(self, task_key: str) -> None:
+        """任务全部确认成功后删除其 manifest。"""
+        all_manifests = self._load_manifests()
+        if task_key in all_manifests:
+            all_manifests.pop(task_key, None)
+            self.save_data(self._manifest_key, all_manifests)
+
+    def _update_manifest_item(self, task_key: str, item: Dict[str, Any]) -> None:
+        """更新并立即持久化一个文件的处理状态。"""
+        all_manifests = self._load_manifests()
+        task = all_manifests.get(task_key) if isinstance(all_manifests.get(task_key), dict) else {"files": {}}
+        files = task.get("files") if isinstance(task.get("files"), dict) else {}
+        item["updated"] = int(time.time())
+        files[item["local_path"]] = dict(item)
+        task["files"] = files
+        task["updated"] = int(time.time())
+        all_manifests[task_key] = task
+        self.save_data(self._manifest_key, all_manifests)
+
+    def _upload_manifest(self, u115: U115Pan, target_dir, task_key: str, manifest: List[Dict[str, Any]]) -> Tuple[bool, int, str, str]:
+        """按 manifest 上传未确认文件，并在每个文件成功后持久化状态。"""
+        folder_cache = {".": target_dir}
+        confirmed = 0
+        try:
+            for index, item in enumerate(manifest, 1):
+                relative_parent = item.get("parent_relative") or "."
+                remote_dir = folder_cache.get(relative_parent)
+                if remote_dir is None:
+                    remote_dir = u115.get_folder(Path(target_dir.path) / relative_parent)
+                    folder_cache[relative_parent] = remote_dir
+                if not remote_dir:
+                    raise PermanentUploadError(f"创建远端子目录失败：{relative_parent}")
+                local_file = Path(item["local_path"])
+                upload_name = item.get("upload_name") or self._resolve_upload_file_name(local_file, item["original_name"])
+                item["upload_name"] = upload_name
+                remote_path = Path(remote_dir.path) / upload_name
+                item["remote_path"] = remote_path.as_posix()
+                existing = u115.get_item(remote_path)
+                if existing:
+                    if not self._remote_matches(u115, existing, item):
+                        raise PermanentUploadError(f"远端同名文件大小或 SHA1 冲突：{remote_path}")
+                    item.update({"status": "confirmed", "remote_file_id": getattr(existing, "fileid", None)})
+                    self._update_manifest_item(task_key, item)
+                    confirmed += 1
+                    logger.info(f"秒传115幂等命中远端文件 {index}/{len(manifest)}：{remote_path}")
+                    continue
+                item["status"] = "pending"
+                result = self._upload_file_instant_only(u115, remote_dir, local_file, item)
+                item.update({"status": "confirmed", "remote_file_id": getattr(result, "fileid", None)})
+                self._update_manifest_item(task_key, item)
+                confirmed += 1
+            return True, confirmed, "success", "全部文件已由远端确认"
+        except LocalUploadRequiredError as err:
+            return False, confirmed, "non_instant", str(err)
+        except Transient115Error as err:
+            return False, confirmed, "transient", str(err)
+        except PermanentUploadError as err:
+            return False, confirmed, "permanent", str(err)
+        except Exception as err:
+            logger.error(f"秒传115 manifest 上传异常：{err}\n{traceback.format_exc()}")
+            return False, confirmed, "transient", str(err)
+
+    def _remote_matches(self, u115: U115Pan, fileitem, item: Dict[str, Any]) -> bool:
+        """通过远端文件 ID 校验同名文件的大小和可用 SHA1。"""
+        file_id = getattr(fileitem, "fileid", None)
+        if not file_id:
+            return False
+        try:
+            info = u115._request_api("GET", "/open/folder/get_info", "data", params={"file_id": int(file_id)})
+        except Exception as err:
+            raise Transient115Error(f"查询远端同名文件失败：file_id={file_id} - {err}") from err
+        if not info:
+            raise Transient115Error(f"查询远端同名文件无响应：file_id={file_id}")
+        if int(info.get("size", -1) or -1) != int(item.get("file_size", -2) or -2):
+            return False
+        remote_sha1 = str(info.get("sha1") or info.get("file_sha1") or "").upper()
+        local_sha1 = str(item.get("file_sha1") or "").upper()
+        return not remote_sha1 or remote_sha1 == local_sha1
 
     def _build_instant_cache(self, local_path: Path) -> Tuple[bool, int, str, Dict[str, Dict[str, Any]]]:
         """构建或复用路径内所有文件的 SHA1、preid 和 size 秒传缓存。"""
@@ -634,77 +761,53 @@ class Instant115(_PluginBase):
             return {}
         return init_resp.get("data") or {}
 
-    def _upload_path_with_guard(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int, str]:
-        """上传路径并在进入分片上传前取消。"""
-        try:
-            ok, count = self._upload_path(u115, target_dir, local_path, instant_cache)
-            return ok, count, "秒传成功" if ok else "上传失败"
-        except LocalUploadRequiredError:
-            return False, 0, "non_instant_upload_required"
-        except Exception as err:
-            logger.error(f"秒传115上传异常：{err}\n{traceback.format_exc()}")
-            return False, 0, str(err)
-
-    def _upload_path(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int]:
-        """使用预检缓存秒传单个文件或目录。"""
-        if local_path.is_file():
-            return (self._upload_file_instant_only(u115, target_dir, local_path, instant_cache) is not None), 1
-        file_count = 0
-        failed = 0
-        folder_cache = {".": target_dir}
-        for root, _, files in os.walk(local_path):
-            root_path = Path(root)
-            relative_dir = root_path.relative_to(local_path)
-            cache_key = relative_dir.as_posix()
-            remote_dir = folder_cache.get(cache_key)
-            if remote_dir is None:
-                remote_dir = u115.get_folder(Path(target_dir.path) / relative_dir)
-                folder_cache[cache_key] = remote_dir
-            if not remote_dir:
-                failed += len(files)
-                continue
-            for filename in files:
-                file_path = root_path / filename
-                if self._upload_file_instant_only(u115, remote_dir, file_path, instant_cache):
-                    file_count += 1
-                else:
-                    failed += 1
-        return failed == 0 and file_count > 0, file_count
-
-
-    def _upload_file_instant_only(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]):
-        """复用预检缓存执行 115 秒传，检测到需要 OSS 分片上传时抛出冷却异常。"""
-        target_name = local_path.name
-        meta = instant_cache.get(local_path.as_posix())
-        if not meta:
-            raise RuntimeError(f"缺少秒传预检缓存：{local_path}")
+    def _upload_file_instant_only(self, u115: U115Pan, target_dir, local_path: Path, meta: Dict[str, Any]):
+        """执行仅秒传上传，并以 115 返回文件 ID 确认远端文件。"""
+        target_name = str(meta.get("upload_name") or local_path.name)
         file_size = int(meta["file_size"])
-        file_sha1 = str(meta["file_sha1"])
-        file_preid = str(meta["file_preid"])
-        upload_name = self._resolve_upload_file_name(local_path, target_name)
-        target_path = Path(target_dir.path) / upload_name
         init_data = {
-            "file_name": upload_name,
-            "file_size": file_size,
-            "target": f"U_1_{target_dir.fileid}",
-            "fileid": file_sha1,
-            "preid": file_preid,
+            "file_name": target_name, "file_size": file_size, "target": f"U_1_{target_dir.fileid}",
+            "fileid": str(meta["file_sha1"]), "preid": str(meta["file_preid"]),
         }
-        init_resp = u115._request_api("POST", "/open/upload/init", data=init_data)
-        if not init_resp or not init_resp.get("state"):
-            logger.warning(f"【115】初始化上传失败，跳过：{target_name} - {init_resp}")
-            return None
-        init_result = init_resp.get("data") or {}
-        init_result = self._handle_115_sign_check(u115, local_path, init_data, init_result)
-        if init_result.get("status") == 2:
-            logger.info(f"【115】{target_name} 秒传成功，115 文件名：{upload_name}")
-            time.sleep(2)
-            uploaded_item = u115.get_item(target_path)
-            if uploaded_item:
-                return uploaded_item
-            return u115._U115Pan__build_uploaded_fileitem(target_path, local_path, file_size)
-        logger.warning(f"秒传115检测到 {target_name} 需要进入 115 分片上传，立即跳过并冷却")
-        raise LocalUploadRequiredError(target_name)
+        try:
+            init_resp = u115._request_api("POST", "/open/upload/init", data=init_data)
+        except Exception as err:
+            raise Transient115Error(f"初始化请求异常：{target_name} - {err}") from err
+        if not init_resp:
+            raise Transient115Error(f"初始化请求无响应：{target_name}")
+        if not init_resp.get("state"):
+            error = init_resp.get("error") or init_resp.get("message") or init_resp.get("msg") or "未知错误"
+            raise Transient115Error(f"初始化失败：{target_name} - {error}")
+        init_result = self._handle_115_sign_check(u115, local_path, init_data, init_resp.get("data") or {})
+        if not init_result:
+            raise Transient115Error(f"二次认证失败：{target_name}")
+        if init_result.get("status") != 2:
+            code = init_result.get("code")
+            message = init_result.get("message") or init_result.get("msg") or init_result.get("tip") or "需要本地分片上传"
+            raise LocalUploadRequiredError(f"{target_name}（status={init_result.get('status')}，code={code}，{message}）")
+        file_id = init_result.get("file_id")
+        if not file_id:
+            raise Transient115Error(f"秒传响应缺少 file_id：{target_name}")
+        info_resp = None
+        try:
+            info_resp = u115._request_api("GET", "/open/folder/get_info", "data", params={"file_id": int(file_id)})
+        except Exception as err:
+            raise Transient115Error(f"远端确认请求异常：{target_name} - {err}") from err
+        if not info_resp:
+            raise Transient115Error(f"远端 ID 暂未确认：{target_name}，file_id={file_id}")
+        remote_size = int(info_resp.get("size", -1) or -1)
+        if remote_size != file_size:
+            raise PermanentUploadError(f"远端确认大小不一致：{target_name}，本地={file_size}，远端={remote_size}")
+        from app import schemas
+        confirmed_item = schemas.FileItem(
+            storage=u115.schema.value, fileid=str(info_resp["file_id"]),
+            path=(Path(target_dir.path) / info_resp["file_name"]).as_posix(), type="file",
+            name=info_resp["file_name"], basename=Path(info_resp["file_name"]).stem,
+            extension=Path(info_resp["file_name"]).suffix[1:], pickcode=info_resp.get("pick_code"),
+            size=remote_size, modify_time=info_resp.get("utime"),
+        )
+        logger.info(f"【115】{local_path.name} 秒传成功并通过远端 ID 确认，115 文件名：{target_name}，file_id={file_id}")
+        return confirmed_item
 
     def _resolve_upload_file_name(self, local_path: Path, original_name: str) -> str:
         """解析提交给 115 上传初始化接口的文件名。"""
