@@ -32,7 +32,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，支持按标签映射 115 目录、MoviePilot 智能重命名与 SHA1/preid 秒传缓存，只接受 115 秒传，非秒传自动冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -63,7 +63,6 @@ class Instant115(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
     _running_lock = threading.Lock()
-    _cancel_events: Dict[str, threading.Event] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         """根据配置初始化插件运行状态。"""
@@ -88,16 +87,20 @@ class Instant115(_PluginBase):
             self._enabled = bool(config.get("enabled", False))
             self._onlyonce = bool(config.get("onlyonce", False))
             self._notify = bool(config.get("notify", True))
-            self._target_path = str(config.get("target_path") or "/PT")
+            configured_target = self._normalize_115_path(str(config.get("target_path") or "/PT"))
+            if configured_target:
+                self._target_path = configured_target
+            else:
+                logger.warning(f"秒传115忽略不安全的默认目标目录：{config.get('target_path')}，使用 /PT")
             self._skip_tags = str(config.get("skip_tags") or "")
             self._uploaded_tag = str(config.get("uploaded_tag") or "已上传115")
             self._tag_path_mappings = str(config.get("tag_path_mappings") or "")
-            self._cooldown_minutes = max(1, int(config.get("cooldown_minutes") or 30))
+            self._cooldown_minutes = self._safe_int(config.get("cooldown_minutes"), 30, minimum=1)
             self._cron = str(config.get("cron") or config.get("scan_cron") or "*/10 * * * *").strip()
-            self._max_retry = max(0, int(config.get("max_retry") or 0))
-            self._max_tasks_per_scan = max(1, int(config.get("max_tasks_per_scan") or 3))
-            self._record_keep_days = max(1, int(config.get("record_keep_days") or 30))
-            self._running_lock_timeout_minutes = max(10, int(config.get("running_lock_timeout_minutes") or 180))
+            self._max_retry = self._safe_int(config.get("max_retry"), 0, minimum=0)
+            self._max_tasks_per_scan = self._safe_int(config.get("max_tasks_per_scan"), 3, minimum=1)
+            self._record_keep_days = self._safe_int(config.get("record_keep_days"), 30, minimum=1)
+            self._running_lock_timeout_minutes = self._safe_int(config.get("running_lock_timeout_minutes"), 180, minimum=10)
             self._clear_records = bool(config.get("clear_records", False))
             self._smart_rename = bool(config.get("smart_rename", False))
             self._smart_rename_fallback = bool(config.get("smart_rename_fallback", True))
@@ -256,9 +259,6 @@ class Instant115(_PluginBase):
 
     def stop_service(self) -> None:
         """停止插件后台调度器并取消插件内检测事件。"""
-        for event in self._cancel_events.values():
-            event.set()
-        self._cancel_events.clear()
         if self._scheduler:
             try:
                 self._scheduler.remove_all_jobs()
@@ -340,7 +340,7 @@ class Instant115(_PluginBase):
         lock_timeout = self._running_lock_timeout_minutes * 60
         if isinstance(runtime, dict) and runtime.get("running") and lock_started and now - lock_started < lock_timeout:
             logger.info(f"秒传115持久化运行锁仍有效，本次扫描跳过；锁定开始：{self._format_time(lock_started)}，超时：{self._running_lock_timeout_minutes} 分钟")
-            return None
+            return False
         if isinstance(runtime, dict) and runtime.get("running") and lock_started and now - lock_started >= lock_timeout:
             logger.warning(f"秒传115检测到运行锁超时，自动释放旧锁；锁定开始：{self._format_time(lock_started)}")
         if not self._running_lock.acquire(blocking=False):
@@ -370,15 +370,17 @@ class Instant115(_PluginBase):
     def _build_upload_queue(self, torrents: List[Any]) -> List[Dict[str, Any]]:
         """先完整检查所有种子并构建待上传队列。"""
         queue: List[Dict[str, Any]] = []
+        records = self._load_records()
+        now = int(time.time())
         logger.info(f"秒传115开始全量检查 qB 种子，共 {len(torrents)} 个")
         for torrent in torrents:
-            allowed, reason = self._check_torrent_rule(torrent)
+            allowed, reason = self._check_torrent_rule(torrent, records=records, now=now)
             name = getattr(torrent, "name", "") or getattr(torrent, "hash", "unknown")
             tags = getattr(torrent, "tags", "") or ""
             progress = float(getattr(torrent, "progress", 0) or 0)
             state = getattr(torrent, "state", "") or ""
             path = getattr(torrent, "content_path", "") or getattr(torrent, "save_path", "") or ""
-            logger.info(f"秒传115检查种子：{name} | state={state} progress={progress:.4f} tags={tags} path={path} | 结果={'入队' if allowed else '剔除'} | 原因={reason}")
+            logger.debug(f"秒传115检查种子：{name} | state={state} progress={progress:.4f} tags={tags} path={path} | 结果={'入队' if allowed else '剔除'} | 原因={reason}")
             if allowed:
                 queue.append({"hash": getattr(torrent, "hash", ""), "name": name, "reason": reason, "path": path, "torrent": torrent, "time": int(time.time())})
         return queue
@@ -388,15 +390,15 @@ class Instant115(_PluginBase):
         view = [{k: v for k, v in item.items() if k != "torrent"} for item in queue]
         self.save_data(self._queue_key, view)
 
-    def _check_torrent_rule(self, torrent) -> Tuple[bool, str]:
+    def _check_torrent_rule(self, torrent, records: Optional[Dict[str, Any]] = None, now: Optional[int] = None) -> Tuple[bool, str]:
         """检查单个种子是否符合上传规则。"""
         if not self._is_completed(torrent):
             return False, "未完成"
         if self._is_skip_tagged(torrent):
             return False, "包含跳过标签"
-        records = self._load_records()
+        records = records if isinstance(records, dict) else self._load_records()
         item = records.get(torrent.hash)
-        now = int(time.time())
+        now = int(now if now is not None else time.time())
         if isinstance(item, dict):
             if item.get("status") == "uploaded":
                 return False, "已上传记录"
@@ -419,10 +421,11 @@ class Instant115(_PluginBase):
                 logger.warning(f"秒传115忽略无效标签目录映射：{line}")
                 continue
             tag, path = [part.strip() for part in line.split("=>", 1)]
-            if not tag or not path:
-                logger.warning(f"秒传115忽略不完整标签目录映射：{line}")
+            normalized_path = self._normalize_115_path(path)
+            if not tag or not normalized_path:
+                logger.warning(f"秒传115忽略不完整或不安全的标签目录映射：{line}")
                 continue
-            mappings.append((tag, path))
+            mappings.append((tag, normalized_path))
         return mappings
 
     def _resolve_target_path(self, torrent) -> str:
@@ -434,6 +437,17 @@ class Instant115(_PluginBase):
                 return path
         logger.info(f"秒传115任务未命中标签路径映射，使用默认目录：{getattr(torrent, 'name', '')} -> {self._target_path}")
         return self._target_path
+
+    @staticmethod
+    def _normalize_115_path(path: str) -> Optional[str]:
+        """规范化 115 绝对路径并拒绝父目录跳转。"""
+        value = str(path or "").strip().replace("\\", "/")
+        if not value.startswith("/"):
+            return None
+        parts = [part for part in value.split("/") if part]
+        if any(part in {".", ".."} for part in parts):
+            return None
+        return "/" + "/".join(parts) if parts else "/"
 
     def _process_torrent(self, u115: U115Pan, torrent) -> None:
         """处理单个 qBittorrent 任务。"""
@@ -459,7 +473,7 @@ class Instant115(_PluginBase):
             return
         logger.info(f"秒传115开始向目标目录秒传写入：{name} -> {target_dir.path}，目录为{'本轮新建' if created_by_plugin else '已存在'}")
         self._write_record(torrent_hash, name, "uploading", reason=f"文件特征缓存完成，准备写入 {file_count} 个文件")
-        ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, torrent_hash, instant_cache)
+        ok, file_count, reason = self._upload_path_with_guard(u115, target_dir, local_path, instant_cache)
         if ok:
             self._clear_instant_cache_for_path(local_path)
             self._write_record(torrent_hash, name, "uploaded", files=file_count, reason=reason)
@@ -502,7 +516,7 @@ class Instant115(_PluginBase):
                 file_mtime = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)))
                 cached = persisted_cache.get(file_key) if isinstance(persisted_cache.get(file_key), dict) else None
                 if cached and int(cached.get("file_size", -1) or -1) == file_size and int(cached.get("mtime", -1) or -1) == file_mtime and cached.get("file_sha1") and cached.get("file_preid"):
-                    logger.info(f"秒传115复用文件特征缓存 {index}/{len(files)}：{file_path}")
+                    logger.debug(f"秒传115复用文件特征缓存 {index}/{len(files)}：{file_path}")
                     item = dict(cached)
                     item.update({"file_name": file_path.name, "file_size": file_size, "mtime": file_mtime, "time": int(time.time())})
                     persisted_cache[file_key] = item
@@ -510,7 +524,7 @@ class Instant115(_PluginBase):
                     reused += 1
                     changed = True
                     continue
-                logger.info(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
+                logger.debug(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
                 file_sha1 = u115._calc_sha1(file_path)
                 file_preid = u115._calc_sha1(file_path, 128 * 1024 * 1024)
                 item = {
@@ -620,9 +634,8 @@ class Instant115(_PluginBase):
             return {}
         return init_resp.get("data") or {}
 
-    def _upload_path_with_guard(self, u115: U115Pan, target_dir, local_path: Path, task_key: str, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int, str]:
+    def _upload_path_with_guard(self, u115: U115Pan, target_dir, local_path: Path, instant_cache: Dict[str, Dict[str, Any]]) -> Tuple[bool, int, str]:
         """上传路径并在进入分片上传前取消。"""
-        del task_key
         try:
             ok, count = self._upload_path(u115, target_dir, local_path, instant_cache)
             return ok, count, "秒传成功" if ok else "上传失败"
@@ -709,6 +722,8 @@ class Instant115(_PluginBase):
             upload_name = Path(str(recommend_name)).name
             if not upload_name:
                 raise ValueError(f"推荐文件名无效：{recommend_name}")
+            if not Path(upload_name).suffix and local_path.suffix:
+                upload_name = f"{upload_name}{local_path.suffix}"
             logger.info(f"秒传115智能重命名：{local_path.name} -> {upload_name}")
             return upload_name
         except Exception as err:
@@ -803,6 +818,20 @@ class Instant115(_PluginBase):
             self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
 
     @staticmethod
+    def _safe_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+        """安全解析整数配置并限制取值范围。"""
+        try:
+            result = int(str(value).strip()) if value not in (None, "") else int(default)
+        except (TypeError, ValueError):
+            logger.warning(f"秒传115忽略无效整数配置：{value}，使用默认值 {default}")
+            result = int(default)
+        if minimum is not None:
+            result = max(minimum, result)
+        if maximum is not None:
+            result = min(maximum, result)
+        return result
+
+    @staticmethod
     def _safe_name(name: str) -> str:
         """生成适用于 115 目录的安全名称。"""
         value = re.sub(r'[^\w\-.\u4e00-\u9fff\[\]()（）【】 ]+', "_", name or "unknown").strip().strip(".")
@@ -818,7 +847,7 @@ class Instant115(_PluginBase):
     def _status_text(self, item: Dict[str, Any]) -> str:
         """生成状态显示文本。"""
         status = item.get("status")
-        mapping = {"uploaded": "已完成", "uploading": "上传中", "cooldown": "冷却中", "failed": "失败"}
+        mapping = {"checking": "校验中", "uploaded": "已完成", "uploading": "上传中", "cooldown": "冷却中", "failed": "失败"}
         text = mapping.get(status, str(status))
         reason = item.get("reason")
         return f"{text}：{reason}" if reason else text
