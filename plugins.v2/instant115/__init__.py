@@ -524,7 +524,7 @@ class Instant115(_PluginBase):
                     reused += 1
                     changed = True
                     continue
-                logger.debug(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
+                logger.info(f"秒传115计算文件特征 {index}/{len(files)}：{file_path}")
                 file_sha1 = u115._calc_sha1(file_path)
                 file_preid = u115._calc_sha1(file_path, 128 * 1024 * 1024)
                 item = {
