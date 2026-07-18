@@ -40,7 +40,7 @@ class Instant115(_PluginBase):
     plugin_name = "秒传115"
     plugin_desc = "监控 qBittorrent 完成任务，支持按标签映射 115 目录、MoviePilot 智能重命名与 SHA1/preid 秒传缓存，只接受 115 秒传，非秒传自动冷却重试。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "local"
     plugin_label = "网盘"
     plugin_config_prefix = "instant115_"
@@ -616,11 +616,61 @@ class Instant115(_PluginBase):
             raise Transient115Error(f"查询远端同名文件失败：file_id={file_id} - {err}") from err
         if not info:
             raise Transient115Error(f"查询远端同名文件无响应：file_id={file_id}")
-        if int(info.get("size", -1) or -1) != int(item.get("file_size", -2) or -2):
+        size_value = self._select_remote_size_value(info)
+        if not self._file_size_matches(size_value, int(item.get("file_size", -2) or -2)):
             return False
         remote_sha1 = str(info.get("sha1") or info.get("file_sha1") or "").upper()
         local_sha1 = str(item.get("file_sha1") or "").upper()
         return not remote_sha1 or remote_sha1 == local_sha1
+
+    @staticmethod
+    def _select_remote_size_value(info: Dict[str, Any]) -> Any:
+        """优先选择远端响应中的原始字节数字段。"""
+        for key in ("file_size", "size_bytes", "size_byte", "fs", "size"):
+            value = info.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    @staticmethod
+    def _parse_file_size(value: Any) -> Optional[int]:
+        """解析远端整数或带 B/KB/MB/GB/TB 单位的文件大小。"""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        text = str(value).strip().replace(",", "")
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB)", text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        multiplier = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}[match.group(2).upper()]
+        return int(float(match.group(1)) * multiplier)
+
+    @staticmethod
+    def _formatted_size_tolerance(value: Any) -> Optional[int]:
+        """根据格式化大小的小数位计算四舍五入允许误差。"""
+        text = str(value or "").strip().replace(",", "")
+        match = re.fullmatch(r"([0-9]+)(?:\.([0-9]+))?\s*(B|KB|MB|GB|TB)", text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        decimals = len(match.group(2) or "")
+        multiplier = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}[match.group(3).upper()]
+        return max(1, int(0.5 * multiplier / (10 ** decimals)))
+
+    @classmethod
+    def _file_size_matches(cls, remote_value: Any, local_size: int) -> bool:
+        """精确比较原始字节数，并对格式化大小使用显示精度容差。"""
+        parsed = cls._parse_file_size(remote_value)
+        if parsed is None:
+            raise Transient115Error(f"无法解析远端文件大小：{remote_value}")
+        tolerance = cls._formatted_size_tolerance(remote_value)
+        if tolerance is None:
+            return parsed == int(local_size)
+        return abs(parsed - int(local_size)) <= tolerance
 
     def _build_instant_cache(self, local_path: Path) -> Tuple[bool, int, str, Dict[str, Dict[str, Any]]]:
         """构建或复用路径内所有文件的 SHA1、preid 和 size 秒传缓存。"""
@@ -795,9 +845,10 @@ class Instant115(_PluginBase):
             raise Transient115Error(f"远端确认请求异常：{target_name} - {err}") from err
         if not info_resp:
             raise Transient115Error(f"远端 ID 暂未确认：{target_name}，file_id={file_id}")
-        remote_size = int(info_resp.get("size", -1) or -1)
-        if remote_size != file_size:
-            raise PermanentUploadError(f"远端确认大小不一致：{target_name}，本地={file_size}，远端={remote_size}")
+        remote_size_value = self._select_remote_size_value(info_resp)
+        if not self._file_size_matches(remote_size_value, file_size):
+            raise PermanentUploadError(f"远端确认大小不一致：{target_name}，本地={file_size}，远端={remote_size_value}")
+        remote_size = self._parse_file_size(remote_size_value)
         from app import schemas
         confirmed_item = schemas.FileItem(
             storage=u115.schema.value, fileid=str(info_resp["file_id"]),
